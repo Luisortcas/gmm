@@ -1,20 +1,16 @@
+import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.cluster import KMeans
-from sklearn.metrics import adjusted_rand_score, silhouette_score
-from sklearn.mixture import GaussianMixture
-from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
 
 
 ROOT = Path(__file__).resolve().parent
-K_VALUES = range(2, 9)
+ARTIFACTS = ROOT / "precomputed"
 MONTHS = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+HOUR_COLUMNS = [f"Hora_{hour:02d}" for hour in range(24)]
 
 st.set_page_config(
     page_title="Perfiles de demanda PJM",
@@ -64,115 +60,50 @@ def load_hourly_data(csv_path: str) -> tuple[pd.DataFrame, dict[str, int]]:
 
 
 @st.cache_data(show_spinner=False)
-def make_daily_profiles(hourly: pd.DataFrame) -> pd.DataFrame:
-    indexed = hourly.assign(
-        Fecha=hourly.index.normalize(),
-        Hora=hourly.index.hour,
-    )
-    profiles = indexed.pivot_table(
-        index="Fecha",
-        columns="Hora",
-        values="PJME_MW",
-        aggfunc="mean",
-    ).reindex(columns=range(24))
-    profiles.columns.name = "Hora"
-    profiles.index.name = "Fecha"
-    return profiles.dropna(axis=0, how="any")
+def load_precomputed_analysis() -> dict[str, object]:
+    daily_path = ARTIFACTS / "daily_analysis.csv"
+    metrics_path = ARTIFACTS / "model_metrics.csv"
+    metadata_path = ARTIFACTS / "metadata.json"
+    for path in (daily_path, metrics_path, metadata_path):
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Falta {path.relative_to(ROOT)}. "
+                "Ejecuta generate_analysis.py antes de iniciar la app."
+            )
+
+    daily = pd.read_csv(daily_path, parse_dates=["Fecha"]).set_index("Fecha").sort_index()
+    metrics = pd.read_csv(metrics_path)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    required_daily_columns = {
+        *HOUR_COLUMNS,
+        "Perfil_KMeans",
+        "Componente_GMM",
+        "Distancia_KMeans",
+        "LogProb_GMM",
+        "Error_AE",
+        "Consumo_Medio_MW",
+        "Pico_Max_MW",
+        "Anomalia_KMeans",
+        "Anomalia_GMM",
+        "Anomalia_AE",
+        "Consenso_Anomalia",
+        "Perfil",
+    }
+    missing_columns = required_daily_columns.difference(daily.columns)
+    if missing_columns:
+        raise ValueError(
+            "El archivo precomputado de resultados está incompleto. Faltan: "
+            f"{', '.join(sorted(missing_columns))}."
+        )
+    return {
+        "metrics": metrics,
+        "results": daily,
+        "autoencoder_iterations": int(metadata["autoencoder_iterations"]),
+    }
 
 
 @st.cache_data(show_spinner=False)
-def run_analysis(daily_profiles: pd.DataFrame) -> dict[str, pd.DataFrame | float | int]:
-    if len(daily_profiles) < max(K_VALUES) + 1:
-        raise ValueError(
-            "Se requieren al menos 9 días completos para comparar todos los "
-            "valores de K entre 2 y 8."
-        )
-
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(daily_profiles)
-    metrics = []
-    kmeans_models = {}
-    gmm_models = {}
-
-    for k in K_VALUES:
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        kmeans.fit(scaled)
-        gmm = GaussianMixture(
-            n_components=k,
-            covariance_type="full",
-            random_state=42,
-            n_init=5,
-        )
-        gmm.fit(scaled)
-
-        km_labels = kmeans.labels_
-        gmm_labels = gmm.predict(scaled)
-        kmeans_models[k] = (kmeans, km_labels)
-        gmm_models[k] = (gmm, gmm_labels)
-        metrics.append(
-            {
-                "K": k,
-                "Inercia K-Means": kmeans.inertia_,
-                "Silueta K-Means": silhouette_score(scaled, km_labels),
-                "Silueta GMM": silhouette_score(scaled, gmm_labels),
-                "AIC GMM": gmm.aic(scaled),
-                "BIC GMM": gmm.bic(scaled),
-                "ARI K-Means vs GMM": adjusted_rand_score(km_labels, gmm_labels),
-            }
-        )
-
-    kmeans, km_labels = kmeans_models[3]
-    gmm, gmm_labels = gmm_models[4]
-    distances = kmeans.transform(scaled).min(axis=1)
-    log_likelihood = gmm.score_samples(scaled)
-
-    autoencoder = MLPRegressor(
-        hidden_layer_sizes=(12, 4, 12),
-        activation="relu",
-        solver="adam",
-        max_iter=500,
-        random_state=42,
-    )
-    autoencoder.fit(scaled, scaled)
-    reconstruction = autoencoder.predict(scaled)
-    reconstruction_error = np.mean((scaled - reconstruction) ** 2, axis=1)
-
-    results = pd.DataFrame(
-        {
-            "Perfil_KMeans": km_labels,
-            "Componente_GMM": gmm_labels,
-            "Distancia_KMeans": distances,
-            "LogProb_GMM": log_likelihood,
-            "Error_AE": reconstruction_error,
-            "Consumo_Medio_MW": daily_profiles.mean(axis=1).to_numpy(),
-            "Pico_Max_MW": daily_profiles.max(axis=1).to_numpy(),
-        },
-        index=daily_profiles.index,
-    )
-    results.index.name = "Fecha"
-    results["Anomalia_KMeans"] = results["Distancia_KMeans"] > np.percentile(
-        distances, 99
-    )
-    results["Anomalia_GMM"] = results["LogProb_GMM"] < np.percentile(
-        log_likelihood, 1
-    )
-    results["Anomalia_AE"] = results["Error_AE"] > np.percentile(
-        reconstruction_error, 99
-    )
-    results["Consenso_Anomalia"] = results[
-        ["Anomalia_KMeans", "Anomalia_GMM", "Anomalia_AE"]
-    ].sum(axis=1)
-
-    average_demand = results.groupby("Perfil_KMeans")["Consumo_Medio_MW"].mean()
-    ordered_labels = average_demand.sort_values().index.tolist()
-    descriptors = ["menor demanda", "demanda intermedia", "mayor demanda"]
-    profile_names = {
-        label: f"Perfil {chr(ord('A') + position)} · "
-        f"{descriptors[position] if len(ordered_labels) == 3 else 'grupo ' + str(position + 1)}"
-        for position, label in enumerate(ordered_labels)
-    }
-    results["Perfil"] = results["Perfil_KMeans"].map(profile_names)
-
+def summarize_results(results: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     summary = (
         results.groupby("Perfil", sort=False)
         .agg(
@@ -184,52 +115,23 @@ def run_analysis(daily_profiles: pd.DataFrame) -> dict[str, pd.DataFrame | float
         )
         .reset_index()
     )
-    curves = (
-        daily_profiles.assign(Perfil=results["Perfil"])
-        .groupby("Perfil", sort=False)[list(range(24))]
-        .mean()
+    curves = results.groupby("Perfil", sort=False)[HOUR_COLUMNS].mean()
+    month_share = (
+        pd.crosstab(results["Perfil"], results.index.month, normalize="index")
+        .reindex(index=summary["Perfil"], columns=range(1, 13), fill_value=0)
+        * 100
     )
-    month_share = pd.crosstab(
-        results["Perfil"],
-        results.index.month,
-        normalize="index",
-    ).reindex(index=summary["Perfil"], columns=range(1, 13), fill_value=0) * 100
-
-    metrics_df = pd.DataFrame(metrics)
-    return {
-        "metrics": metrics_df,
-        "results": results,
-        "summary": summary,
-        "curves": curves,
-        "month_share": month_share,
-        "autoencoder_iterations": int(autoencoder.n_iter_),
-    }
+    return summary, curves, month_share
 
 
 def main() -> None:
     st.title("Perfiles y anomalías de la demanda eléctrica PJM")
     st.caption("Análisis no supervisado de perfiles diarios · Autores: Luis Ortega y Nicolas Carvajal")
 
-    available_files = [
-        ROOT / name
-        for name in ("PJME_hourly.csv", "data.csv")
-        if (ROOT / name).is_file()
-    ]
-    if not available_files:
-        st.error("No se encontró PJME_hourly.csv ni data.csv junto a app.py.")
-        st.stop()
-
-    file_names = [path.name for path in available_files]
-    default_index = file_names.index("PJME_hourly.csv") if "PJME_hourly.csv" in file_names else 0
-    selected_file = st.sidebar.selectbox(
-        "Fuente de datos",
-        file_names,
-        index=default_index,
-    )
-
     try:
-        hourly, quality = load_hourly_data(str(ROOT / selected_file))
-    except (FileNotFoundError, ValueError) as error:
+        hourly, quality = load_hourly_data(str(ROOT / "PJME_hourly.csv"))
+        analysis = load_precomputed_analysis()
+    except (FileNotFoundError, ValueError, KeyError) as error:
         st.error(str(error))
         st.stop()
 
@@ -240,8 +142,14 @@ def main() -> None:
         st.stop()
 
     filtered_hourly = hourly.loc[hourly.index.year.isin(selected_years)]
-    daily = make_daily_profiles(filtered_hourly)
-    incomplete_days = int(filtered_hourly.index.normalize().nunique() - len(daily))
+    all_results = analysis["results"]
+    results = all_results.loc[all_results.index.year.isin(selected_years)]
+    if results.empty:
+        st.error("No hay resultados precomputados para los años seleccionados.")
+        st.stop()
+    metrics = analysis["metrics"]
+    summary, curves, month_share = summarize_results(results)
+    incomplete_days = int(filtered_hourly.index.normalize().nunique() - len(results))
 
     st.markdown(
         """
@@ -252,9 +160,9 @@ def main() -> None:
     )
     st.markdown(
         """
-        **Datos.** Serie horaria de demanda PJM en MW. El repositorio incluye
-        `PJME_hourly.csv` y una versión con variables de calendario (`data.csv`);
-        ambas se preparan usando las lecturas `Datetime` y `PJME_MW`.
+        **Datos.** Serie horaria de demanda PJM en MW (`PJME_hourly.csv`).
+        Los modelos ya fueron ajustados y sus resultados están incluidos con la
+        aplicación; al abrir este dashboard no se vuelven a entrenar.
         """
     )
 
@@ -264,7 +172,7 @@ def main() -> None:
         "Periodo seleccionado",
         f"{filtered_hourly.index.min():%Y-%m-%d} – {filtered_hourly.index.max():%Y-%m-%d}",
     )
-    third_col.metric("Días completos", f"{len(daily):,}")
+    third_col.metric("Días completos", f"{len(results):,}")
     fourth_col.metric("Marcas duplicadas agregadas", f"{quality['duplicate_timestamps']:,}")
 
     with st.expander("Preprocesamiento y calidad de datos"):
@@ -277,8 +185,9 @@ def main() -> None:
         )
         st.write(
             f"En el periodo seleccionado se excluyeron {incomplete_days:,} fechas "
-            "incompletas. Cada hora se estandariza con `StandardScaler` antes del "
-            "ajuste, para que las escalas horarias sean comparables."
+            "incompletas. Cada hora se estandarizó con `StandardScaler` al generar "
+            "los resultados precomputados. El filtro de años solo limita lo que se "
+            "visualiza; no vuelve a ajustar los modelos."
         )
 
     st.markdown(
@@ -293,41 +202,20 @@ def main() -> None:
         1 y 99, respectivamente.
         """
     )
+    st.caption(
+        "Los modelos se entrenaron previamente con el periodo completo. "
+        "El selector de años solo filtra las tablas y visualizaciones."
+    )
 
-    analysis_key = (selected_file, tuple(selected_years))
-    if st.button("Ejecutar análisis completo", type="primary"):
-        st.session_state["analysis_key"] = analysis_key
-
-    if st.session_state.get("analysis_key") != analysis_key:
-        st.info(
-            "Ejecuta el análisis para calcular las métricas, perfiles, anomalías "
-            "y visualizaciones interactivas."
-        )
-        monthly = filtered_hourly["PJME_MW"].resample("MS").mean().rename("Demanda media (MW)").reset_index()
-        overview = px.line(
-            monthly,
-            x="Datetime",
-            y="Demanda media (MW)",
-            title="Demanda media mensual",
-            labels={"Datetime": "Fecha"},
-        )
-        overview.update_layout(hovermode="x unified")
-        st.plotly_chart(overview, width="stretch")
-        st.stop()
-
-    try:
-        with st.spinner("Ajustando modelos y calculando métricas. Esto puede tardar un momento…"):
-            analysis = run_analysis(daily)
-    except ValueError as error:
-        st.error(str(error))
-        st.stop()
-
-    metrics = analysis["metrics"]
-    results = analysis["results"]
-    summary = analysis["summary"]
-
-    overview_tab, methods_tab, profiles_tab, anomalies_tab, conclusions_tab = st.tabs(
-        ["Resumen", "Metodología y comparación", "Perfiles", "Anomalías", "Conclusiones"]
+    overview_tab, methods_tab, profiles_tab, anomalies_tab, conclusions_tab, html_tab = st.tabs(
+        [
+            "Resumen",
+            "Metodología y comparación",
+            "Perfiles",
+            "Anomalías",
+            "Conclusiones",
+            "HTML adicional",
+        ]
     )
 
     with overview_tab:
@@ -431,7 +319,7 @@ def main() -> None:
     with profiles_tab:
         st.subheader("Perfiles diarios K-Means (K=3)")
         profile_fig = go.Figure()
-        for profile, row in analysis["curves"].iterrows():
+        for profile, row in curves.iterrows():
             profile_fig.add_trace(
                 go.Scatter(
                     x=list(range(24)),
@@ -450,7 +338,7 @@ def main() -> None:
         )
         st.plotly_chart(profile_fig, width="stretch")
 
-        month_share = analysis["month_share"].copy()
+        month_share = month_share.copy()
         month_share.columns = MONTHS
         heatmap = px.imshow(
             month_share,
@@ -497,7 +385,7 @@ def main() -> None:
                 ),
             )
         )
-        threshold = float(results["Error_AE"].quantile(0.99))
+        threshold = float(all_results["Error_AE"].quantile(0.99))
         chart.add_hline(
             y=threshold,
             line_dash="dash",
@@ -600,6 +488,17 @@ def main() -> None:
             "para el ajuste; no debe interpretarse como una evaluación de "
             "generalización."
         )
+
+    with html_tab:
+        st.subheader("Visualización interactiva de demanda por hora y mes")
+        try:
+            html_path = ROOT / "PJME_Hrs,Mes,Demanda.html"
+            if not html_path.is_file():
+                raise FileNotFoundError(f"No se encontró {html_path.name}.")
+        except FileNotFoundError as error:
+            st.error(str(error))
+        else:
+            st.iframe(html_path, height=800)
 
 
 if __name__ == "__main__":

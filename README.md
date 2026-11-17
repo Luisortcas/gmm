@@ -15,9 +15,22 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-La aplicación detecta `PJME_hourly.csv` o `data.csv` en la misma carpeta.
-Ambos deben incluir las columnas `Datetime` y `PJME_MW`. El archivo
-`PJME_hourly.csv` se selecciona por defecto.
+El dashboard carga los resultados precomputados de `precomputed/` y la
+visualización `PJME_Hrs,Mes,Demanda.html`; no ajusta modelos cuando un usuario
+abre la app. Mantén esos archivos, `PJME_hourly.csv` y `app.py` en el mismo
+repositorio al desplegar.
+
+## Regenerar resultados (opcional)
+
+Solo si cambian los datos o la metodología, ejecuta una vez:
+
+```bash
+python -m pip install -r requirements-analysis.txt
+python generate_analysis.py
+```
+
+El entrenamiento se realiza en esta etapa offline. El uso normal del dashboard
+solo lee los CSV y JSON generados.
 
 ## Metodología
 
@@ -45,3 +58,10 @@ es descriptivo, no causal ni un pronóstico operativo. No se incluyen clima,
 festivos, precios, generación o registros de eventos. Los modelos se ajustan
 y evalúan sobre el mismo periodo; se recomienda validar con particiones
 temporales y datos más recientes antes de usar los resultados para decisiones.
+
+## Publicar y obtener un enlace
+
+Despliega `app.py` en Streamlit Community Cloud, seleccionando este repositorio
+y la rama `main`. Asegúrate de subir también la carpeta `precomputed/`, el CSV
+de demanda y el archivo HTML; Streamlit instalará las dependencias desde
+`requirements.txt`. El enlace de la app se genera al completar el despliegue.

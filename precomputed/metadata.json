@@ -1,0 +1,11 @@
+{
+  "source": "PJME_hourly.csv",
+  "raw_rows": 145366,
+  "invalid_rows": 0,
+  "duplicate_timestamps": 4,
+  "complete_days": 6027,
+  "incomplete_days": 32,
+  "start_date": "2002-01-02",
+  "end_date": "2018-08-02",
+  "autoencoder_iterations": 62
+}
